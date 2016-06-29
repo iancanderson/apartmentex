@@ -4,7 +4,7 @@ defmodule Apartmentex.Mixfile do
   def project do
     [app: :apartmentex,
      version: "0.0.1",
-     elixir: "~> 1.2-dev",
+     elixir: "~> 1.3",
      build_embedded: Mix.env == :prod,
      start_permanent: Mix.env == :prod,
      deps: deps]
@@ -28,6 +28,6 @@ defmodule Apartmentex.Mixfile do
   # Type "mix help deps" for more examples and options
   defp deps do
     [{:postgrex, ">= 0.0.0"},
-    {:ecto, "~> 1.0"}]
+    {:ecto, "~> 2.0"}]
   end
 end
