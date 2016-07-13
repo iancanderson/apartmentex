@@ -2,17 +2,12 @@ defmodule Apartmentex.Adapters.SQL do
   @moduledoc """
   Behaviour and implementation for SQL adapters.
 
-  The implementation for SQL adapter provides a
-  pooled based implementation of SQL and also expose
-  a query function to developers.
+  The implementation for SQL adapter relies on `DBConnection`
+  to provide pooling, prepare, execute and more.
 
   Developers that use `Ecto.Adapters.SQL` should implement
-  a connection module with specifics on how to connect
-  to the database and also how to translate the queries
-  to SQL.
-
-  See `Ecto.Adapters.Connection` for connection processes and
-  `Ecto.Adapters.SQL.Query` for the query semantics.
+  the callbacks required both by this module and the ones
+  from `Ecto.Adapters.SQL.Query` about building queries.
   """
 
   @doc false
@@ -25,42 +20,67 @@ defmodule Apartmentex.Adapters.SQL do
       @conn __MODULE__.Connection
       @adapter unquote(adapter)
 
-      ## Worker
-
       @doc false
-      defmacro __before_compile__(_env) do
-        :ok
+      defmacro __before_compile__(env) do
+        Apartmentex.Adapters.SQL.__before_compile__(@conn, env)
       end
 
       @doc false
-      def start_link(repo, opts) do
-        {:ok, _} = Application.ensure_all_started(@adapter)
-        Apartmentex.Adapters.SQL.start_link(@conn, @adapter, repo, opts)
+      def ensure_all_started(repo, type) do
+        {_, opts} = repo.__pool__
+        with {:ok, pool} <- DBConnection.ensure_all_started(opts, type),
+             {:ok, adapter} <- Application.ensure_all_started(@adapter, type),
+             # We always return the adapter to force it to be restarted if necessary
+             do: {:ok, pool ++ List.delete(adapter, @adapter) ++ [@adapter]}
+      end
+
+      @doc false
+      def child_spec(repo, opts) do
+        Apartmentex.Adapters.SQL.child_spec(@conn, @adapter, repo, opts)
       end
 
       ## Types
 
-      def embed_id(_), do: Ecto.UUID.generate
-      def load(type, value), do: Apartmentex.Adapters.SQL.load(type, value, &load/2)
-      def dump(type, value), do: Apartmentex.Adapters.SQL.dump(type, value, &dump/2)
+      @doc false
+      def autogenerate(:id),        do: nil
+      def autogenerate(:embed_id),  do: Ecto.UUID.generate()
+      def autogenerate(:binary_id), do: Ecto.UUID.bingenerate()
+
+      @doc false
+      def loaders({:embed, _} = type, _), do: [&Apartmentex.Adapters.SQL.load_embed(type, &1)]
+      def loaders(:binary_id, type),      do: [Ecto.UUID, type]
+      def loaders(_, type),               do: [type]
+
+      @doc false
+      def dumpers({:embed, _} = type, _), do: [&Apartmentex.Adapters.SQL.dump_embed(type, &1)]
+      def dumpers(:binary_id, type),      do: [type, Ecto.UUID]
+      def dumpers(_, type),               do: [type]
 
       ## Query
 
       @doc false
-      def prepare(:all, query),        do: {:cache, @conn.all(query)}
-      def prepare(:update_all, query), do: {:cache, @conn.update_all(query)}
-      def prepare(:delete_all, query), do: {:cache, @conn.delete_all(query)}
+      def prepare(:all, query),
+        do: {:cache, {System.unique_integer([:positive]), @conn.all(query)}}
+      def prepare(:update_all, query),
+        do: {:cache, {System.unique_integer([:positive]), @conn.update_all(query)}}
+      def prepare(:delete_all, query),
+        do: {:cache, {System.unique_integer([:positive]), @conn.delete_all(query)}}
 
       @doc false
-      def execute(repo, meta, prepared, params, preprocess, opts) do
-        Apartmentex.Adapters.SQL.execute(repo, meta, prepared, params, preprocess, opts)
-      end   
+      def execute(repo, meta, query, params, process, opts) do
+        Apartmentex.Adapters.SQL.execute(repo, meta, query, params, process, opts)
+      end
 
       ## Transaction
 
       @doc false
       def transaction(repo, opts, fun) do
         Apartmentex.Adapters.SQL.transaction(repo, opts, fun)
+      end
+
+      @doc false
+      def in_transaction?(repo) do
+        Apartmentex.Adapters.SQL.in_transaction?(repo)
       end
 
       @doc false
@@ -72,23 +92,15 @@ defmodule Apartmentex.Adapters.SQL do
 
       @doc false
       def execute_ddl(repo, definition, opts) do
-        sqls = @conn.execute_ddl(definition)
-
-        for sql <- List.wrap(sqls) do
-          Apartmentex.Adapters.SQL.query!(repo, sql, [], opts)
-        end
-
+        sql = @conn.execute_ddl(definition)
+        Apartmentex.Adapters.SQL.query!(repo, sql, [], opts)
         :ok
       end
 
       defoverridable [prepare: 2, execute: 6,
-                      execute_ddl: 3, embed_id: 1,
-                      load: 2, dump: 2]
+                      execute_ddl: 3, loaders: 2, dumpers: 2, autogenerate: 1, ensure_all_started: 2]
     end
   end
-
-  alias Ecto.Pool
-  alias Apartmentex.Adapters.SQL.Sandbox
 
   @doc """
   Converts the given query to SQL according to its kind and the
@@ -112,11 +124,18 @@ defmodule Apartmentex.Adapters.SQL do
   def to_sql(kind, repo, queryable) do
     adapter = repo.__adapter__
 
-    {_meta, prepared, params} =
-      Ecto.Queryable.to_query(queryable)
-      |> Ecto.Query.Planner.query(kind, repo, adapter)
-
-    {prepared, params}
+    queryable
+    |> Ecto.Queryable.to_query()
+    |> Ecto.Query.Planner.returning(kind == :all)
+    |> Ecto.Query.Planner.query(kind, repo, adapter)
+    |> case do
+      {_meta, {:cached, {_id, cached}}, params} ->
+        {String.Chars.to_string(cached), params}
+      {_meta, {:cache, _update, {_id, prepared}}, params} ->
+        {prepared, params}
+      {_meta, {:nocache, {_id, prepared}}, params} ->
+        {prepared, params}
+    end
   end
 
   @doc """
@@ -125,7 +144,7 @@ defmodule Apartmentex.Adapters.SQL do
   @spec query!(Ecto.Repo.t, String.t, [term], Keyword.t) ::
                %{rows: nil | [tuple], num_rows: non_neg_integer} | no_return
   def query!(repo, sql, params, opts \\ []) do
-    query!(repo, sql, params, nil, opts)
+    query!(repo, sql, map_params(params), fn x -> x end, opts)
   end
 
   defp query!(repo, sql, params, mapper, opts) do
@@ -150,8 +169,10 @@ defmodule Apartmentex.Adapters.SQL do
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the call to finish,
-      `:infinity` will wait indefinitely (default: 5000)
+    * `:timeout` - The time in milliseconds to wait for a query to finish,
+      `:infinity` will wait indefinitely. (default: 15_000)
+    * `:pool_timeout` - The time in milliseconds to wait for a call to the pool
+      to finish, `:infinity` will wait indefinitely. (default: 5_000)
 
     * `:log` - When false, does not log the query
 
@@ -164,81 +185,92 @@ defmodule Apartmentex.Adapters.SQL do
   @spec query(Ecto.Repo.t, String.t, [term], Keyword.t) ::
               {:ok, %{rows: nil | [tuple], num_rows: non_neg_integer}} | {:error, Exception.t}
   def query(repo, sql, params, opts \\ []) do
-    query(repo, sql, params, nil, opts)
+    query(repo, sql, map_params(params), fn x -> x end, opts)
   end
 
   defp query(repo, sql, params, mapper, opts) do
-    case query(repo, sql, params, nil, mapper, opts) do
-      {result, entry} ->
-        log(repo, entry)
-        result
-      :noconnect ->
-        # :noconnect can never be the reason a call fails because
-        # it is converted to {:nodedown, node}. This means the exit
-        # reason can be easily identified.
-        exit({:noconnect, {__MODULE__, :query, [repo, sql, params, opts]}})
+    sql_call(repo, :execute, [sql], params, mapper, opts)
+  end
+
+  defp sql_call(repo, callback, args, params, mapper, opts) do
+    {pool, default_opts} = repo.__pool__
+    conn = get_conn(pool) || pool
+    opts = [decode_mapper: mapper] ++ with_log(repo, params, opts ++ default_opts)
+    args = args ++ [params, opts]
+    try do
+      apply(repo.__sql__, callback, [conn | args])
+    rescue
+      err in DBConnection.OwnershipError ->
+        message = err.message <> "\nSee Ecto.Adapters.SQL.Sandbox docs for more information."
+        reraise %{err | message: message}, System.stacktrace
     end
   end
 
-  defp query(repo, sql, params, outer_queue_time, mapper, opts) do
-    {pool_mod, pool, timeout, _} = repo.__pool__
-    opts    = Keyword.put_new(opts, :timeout, timeout)
-    timeout = Keyword.fetch!(opts, :timeout)
-    {log?, opts} = Keyword.pop(opts, :log, true)
-
-    query_fun = fn({mod, conn}, inner_queue_time) ->
-      query(mod, conn, inner_queue_time || outer_queue_time, sql, params, log?, opts)
-    end
-
-    case Pool.run(pool_mod, pool, timeout, query_fun) do
-      {:ok, {result, entry}} ->
-        decode(result, entry, mapper)
-      {:error, :noconnect} ->
-        :noconnect
-      {:error, :noproc} ->
-        raise ArgumentError, "repo #{inspect repo} is not started, " <>
-                             "please ensure it is part of your supervision tree"
+  defp map_params(params) do
+    Enum.map params, fn
+      %{__struct__: _} = value ->
+        {:ok, value} = Ecto.DataType.dump(value)
+        value
+      [_|_] = value ->
+        {:ok, value} = Ecto.DataType.dump(value)
+        value
+      value ->
+        value
     end
   end
-
-  defp query(mod, conn, _queue_time, sql, params, false, opts) do
-    {mod.query(conn, sql, params, opts), nil}
-  end
-  defp query(mod, conn, queue_time, sql, params, true, opts) do
-    {query_time, result} = :timer.tc(mod, :query, [conn, sql, params, opts])
-    entry = %Ecto.LogEntry{query: sql, params: params, connection_pid: conn,
-                           query_time: query_time, queue_time: queue_time}
-    {result, entry}
-  end
-
-  defp decode(result, nil, nil) do
-    {result, nil}
-  end
-  defp decode(result, nil, mapper) do
-    {decode(result, mapper), nil}
-  end
-  defp decode(result, entry, nil) do
-    {result, %{entry | result: result}}
-  end
-  defp decode(result, %{query_time: query_time} = entry, mapper) do
-    {decode_time, decoded} = :timer.tc(fn -> decode(result, mapper) end)
-    {decoded, %{entry | result: decoded, query_time: query_time + decode_time}}
-  end
-
-  defp decode({:ok, %{rows: rows} = res}, mapper) when is_list(rows) do
-    {:ok, %{res | rows: Enum.map(rows, mapper)}}
-  end
-  defp decode(other, _mapper) do
-    other
-  end
-
-  defp log(_repo, nil), do: :ok
-  defp log(repo, entry), do: repo.log(entry)
 
   ## Worker
 
+  @pool_timeout 5_000
+  @timeout 15_000
+
   @doc false
-  def start_link(connection, adapter, _repo, opts) do
+  def __before_compile__(conn, env) do
+    config = Module.get_attribute(env.module, :config)
+    pool   = Keyword.get(config, :pool, DBConnection.Poolboy)
+    if pool == Ecto.Adapters.SQL.Sandbox and config[:pool_size] == 1 do
+      IO.puts :stderr, "warning: setting the :pool_size to 1 for #{inspect env.module} " <>
+                       "when using the Ecto.Adapters.SQL.Sandbox pool is deprecated and " <>
+                       "won't work as expected. Please remove the :pool_size configuration " <>
+                       "or set it to a reasonable number like 10"
+    end
+
+    pool_name = pool_name(env.module, config)
+    norm_config = normalize_config(config)
+    quote do
+      @doc false
+      def __sql__, do: unquote(conn)
+
+      @doc false
+      def __pool__, do: {unquote(pool_name), unquote(Macro.escape(norm_config))}
+
+      defoverridable [__pool__: 0]
+    end
+  end
+
+  defp normalize_config(config) do
+    config
+    |> Keyword.delete(:name)
+    |> Keyword.update(:pool, DBConnection.Poolboy, &normalize_pool/1)
+    |> Keyword.put_new(:timeout, @timeout)
+    |> Keyword.put_new(:pool_timeout, @pool_timeout)
+  end
+
+  defp normalize_pool(Ecto.Adapters.SQL.Sandbox),
+    do: DBConnection.Ownership
+  defp normalize_pool(pool),
+    do: pool
+
+  defp pool_name(module, config) do
+    Keyword.get(config, :pool_name, default_pool_name(module, config))
+  end
+
+  defp default_pool_name(repo, config) do
+    Module.concat(Keyword.get(config, :name, repo), Pool)
+  end
+
+  @doc false
+  def child_spec(connection, adapter, repo, opts) do
     unless Code.ensure_loaded?(connection) do
       raise """
       could not find #{inspect connection}.
@@ -249,65 +281,114 @@ defmodule Apartmentex.Adapters.SQL do
 
       And remember to recompile Ecto afterwards by cleaning the current build:
 
-          mix deps.clean ecto
+          mix deps.clean --build ecto
       """
     end
 
-    {pool, opts} = Keyword.pop(opts, :pool)
-    pool.start_link(connection, opts)
+    # Check if the pool options should overriden
+    {pool_name, pool_opts} = case Keyword.fetch(opts, :pool) do
+      {:ok, pool} when pool != Ecto.Adapters.SQL.Sandbox ->
+        {pool_name(repo, opts), opts}
+      _ ->
+        repo.__pool__
+    end
+    opts = [name: pool_name] ++ Keyword.delete(opts, :pool) ++ pool_opts
+
+    opts =
+      if function_exported?(repo, :after_connect, 1) and not Keyword.has_key?(opts, :after_connect) do
+        IO.puts :stderr, "warning: #{inspect repo}.after_connect/1 is deprecated. If you want to " <>
+                         "perform some action after connecting, please set after_connect: {module, fun, args}" <>
+                         "in your repository configuration"
+        Keyword.put(opts, :after_connect, {repo, :after_connect, []})
+      else
+        opts
+      end
+
+    connection.child_spec(opts)
   end
 
   ## Types
-
   @doc false
-  def load({:embed, _} = type, data, loader),
-    do: Ecto.Type.load(type, data, fn
-          {:embed, _} = type, value -> loader.(type, value)
-          type, value -> Ecto.Type.cast(type, value)
-        end)
-  def load(:binary_id, data, loader),
-    do: Ecto.Type.load(Ecto.UUID, data, loader)
-  def load(type, data, loader),
-    do: Ecto.Type.load(type, data, loader)
-
-  @doc false
-  def dump({:embed, _} = type, data, dumper),
-    do: Ecto.Type.dump(type, data, fn
-          {:embed, _} = type, value -> dumper.(type, value)
-          _type, value -> {:ok, value}
-        end)
-  def dump(:binary_id, data, dumper),
-    do: Ecto.Type.dump(Ecto.UUID, data, dumper)
-  def dump(type, data, dumper),
-    do: Ecto.Type.dump(type, data, dumper)
-
-  @doc false
-  def bingenerate(key) do
-    {:ok, value} = Ecto.UUID.dump(Ecto.UUID.generate)
-    {[{key, value}], [{key, unwrap(value)}]}
+  def load_embed(type, value) do
+    Ecto.Type.load(type, value, fn
+      {:embed, _} = type, value -> load_embed(type, value)
+      type, value -> Ecto.Type.cast(type, value)
+    end)
   end
 
-  defp unwrap(%Ecto.Query.Tagged{value: value}), do: value
-  defp unwrap(value), do: value
+  @doc false
+  def dump_embed(type, value) do
+    Ecto.Type.dump(type, value, fn
+      {:embed, _} = type, value -> dump_embed(type, value)
+      _type, value -> {:ok, value}
+    end)
+  end
 
   ## Query
 
+  # @doc false
+  # def insert_all(repo, conn, prefix, source, header, rows, returning, opts) do
+  #   {rows, params} = unzip_inserts(header, rows)
+  #   sql = conn.insert(prefix, source, header, rows, returning)
+  #   %{rows: rows, num_rows: num} = query!(repo, sql, Enum.reverse(params), nil, opts)
+  #   {num, rows}
+  # end
+  #
+  # defp unzip_inserts(header, rows) do
+  #   Enum.map_reduce rows, [], fn fields, params ->
+  #     Enum.map_reduce header, params, fn key, acc ->
+  #       case :lists.keyfind(key, 1, fields) do
+  #         {^key, value} -> {key, [value|acc]}
+  #         false -> {nil, acc}
+  #       end
+  #     end
+  #   end
+  # end
+
   @doc false
-  def execute(repo, _meta, prepared, params, nil, opts) do
-    %{rows: rows, num_rows: num} = query!(repo, prepared, params, nil, opts)
+  def execute(repo, _meta, {:cache, update, {id, prepared}}, params, nil, opts) do
+    execute_and_cache(repo, id, update, prepared, params, nil, opts)
+  end
+
+  def execute(repo, %{fields: fields}, {:cache, update, {id, prepared}}, params, process, opts) do
+    mapper = &process_row(&1, process, fields)
+    execute_and_cache(repo, id, update, prepared, params, mapper, opts)
+  end
+
+  def execute(repo, _meta, {_, {_id, prepared_or_cached}}, params, nil, opts) do
+    %{rows: rows, num_rows: num} =
+      sql_call!(repo, :execute, [prepared_or_cached], params, nil, opts)
     {num, rows}
   end
 
-  def execute(repo, meta, prepared, params, preprocess, opts) do
-    fields = count_fields(meta.select.fields, meta.sources)
-    mapper = &process_row(&1, preprocess, fields)
-    %{rows: rows, num_rows: num} = query!(repo, prepared, params, mapper, opts)
+  def execute(repo, %{fields: fields}, {_, {_id, prepared_or_cached}}, params, process, opts) do
+    mapper = &process_row(&1, process, fields)
+    %{rows: rows, num_rows: num} =
+      sql_call!(repo, :execute, [prepared_or_cached], params, mapper, opts)
     {num, rows}
   end
 
+  defp execute_and_cache(repo, id, update, prepared, params, mapper, opts) do
+    name = "ecto_" <> Integer.to_string(id)
+    case sql_call(repo, :prepare_execute, [name, prepared], params, mapper, opts) do
+      {:ok, query, %{num_rows: num, rows: rows}} ->
+        update.({0, query})
+        {num, rows}
+      {:error, err} ->
+        raise err
+    end
+  end
+
+  defp sql_call!(repo, callback, args, params, mapper, opts) do
+    case sql_call(repo, callback, args, params, mapper, opts) do
+      {:ok, res}    -> res
+      {:error, err} -> raise err
+    end
+  end
+
   @doc false
-  def model(repo, conn, sql, values, returning, opts) do
-    case query(repo, sql, values, nil, opts) do
+  def struct(repo, conn, sql, values, returning, opts) do
+    case query(repo, sql, values, fn x -> x end, opts) do
       {:ok, %{rows: nil, num_rows: 1}} ->
         {:ok, []}
       {:ok, %{rows: [values], num_rows: 1}} ->
@@ -322,25 +403,15 @@ defmodule Apartmentex.Adapters.SQL do
     end
   end
 
-  defp count_fields(fields, sources) do
-    Enum.map fields, fn
-      {:&, _, [idx]} = field ->
-        {_source, model} = elem(sources, idx)
-        {field, length(model.__schema__(:fields))}
-      field ->
-        {field, 0}
-    end
-  end
-
-  defp process_row(row, preprocess, fields) do
+  defp process_row(row, process, fields) do
     Enum.map_reduce(fields, row, fn
-      {field, 0}, [h|t] ->
-        {preprocess.(field, h, nil), t}
-      {field, count}, acc ->
-        case split_and_not_nil(acc, count, true, []) do
+      {:&, _, [_, _, counter]} = field, acc ->
+        case split_and_not_nil(acc, counter, true, []) do
           {nil, rest} -> {nil, rest}
-          {val, rest} -> {preprocess.(field, val, nil), rest}
+          {val, rest} -> {process.(field, val, nil), rest}
         end
+      field, [h|t] ->
+        {process.(field, h, nil), t}
     end) |> elem(0)
   end
 
@@ -359,105 +430,76 @@ defmodule Apartmentex.Adapters.SQL do
 
   @doc false
   def transaction(repo, opts, fun) do
-    {pool_mod, pool, timeout} = repo.__pool__
-    opts    = Keyword.put_new(opts, :timeout, timeout)
-    timeout = Keyword.fetch!(opts, :timeout)
-
-    transaction = fn
-      :opened, ref, {mod, _conn}, queue_time ->
-        mode = transaction_mode(pool_mod, pool, timeout)
-        transaction(repo, ref, mod, mode, queue_time, timeout, opts, fun)
-      :already_open, ref, _, _ ->
-        {{:return, Pool.with_rollback(:already_open, ref, fun)}, nil}
+   {pool, default_opts} = repo.__pool__
+    opts = with_log(repo, [], opts ++ default_opts)
+    case get_conn(pool) do
+      nil  -> do_transaction(pool, opts, fun)
+      conn -> DBConnection.transaction(conn, fn(_) -> fun.() end, opts)
     end
+  end
 
-    case Pool.transaction(pool_mod, pool, timeout, transaction) do
-      {{:return, result}, entry} ->
-        log(repo, entry)
-        result
-      {{:raise, class, reason, stack}, entry} ->
-        log(repo, entry)
-        :erlang.raise(class, reason, stack)
-      {{:error, err}, entry} ->
-        log(repo, entry)
-        raise err
-      {:error, :noconnect} ->
-        exit({:noconnect, {__MODULE__, :transaction, [repo, opts, fun]}})
-      {:error, :noproc} ->
-        raise ArgumentError, "repo #{inspect repo} is not started, " <>
-                             "please ensure it is part of your supervision tree"
+  defp do_transaction(pool, opts, fun) do
+    run = fn(conn) ->
+      try do
+        put_conn(pool, conn)
+        fun.()
+      after
+        delete_conn(pool)
+      end
     end
+    DBConnection.transaction(pool, run, opts)
+  end
+
+  @doc false
+  def in_transaction?(repo) do
+    {pool, _} = repo.__pool__
+    !!get_conn(pool)
   end
 
   @doc false
   def rollback(repo, value) do
-    {pool_mod, pool, _timeout} = repo.__pool__
-    Pool.rollback(pool_mod, pool, value)
-  end
-
-  defp transaction_mode(Sandbox, pool, timeout), do: Sandbox.mode(pool, timeout)
-  defp transaction_mode(_, _, _), do: :raw
-
-  defp transaction(repo, ref, mod, mode, queue_time, timeout, opts, fun) do
-    case begin(repo, mod, mode, queue_time, opts) do
-      {{:ok, _}, entry} ->
-        safe = fn -> log(repo, entry); fun.() end
-        case Pool.with_rollback(:opened, ref, safe) do
-          {:ok, _} = ok ->
-            commit(repo, ref, mod, mode, timeout, opts, {:return, ok})
-          {:error, _} = error ->
-            rollback(repo, ref, mod, mode, timeout, opts, {:return, error})
-          {:raise, _kind, _reason, _stack} = raise ->
-            rollback(repo, ref, mod, mode, timeout, opts, raise)
-        end
-      {{:error, _err}, _entry} = error ->
-        Pool.break(ref, timeout)
-        error
-      :noconnect ->
-        {:error, :noconnect}
+    {pool, _} = repo.__pool__
+    case get_conn(pool) do
+      nil  -> raise "cannot call rollback outside of transaction"
+      conn -> DBConnection.rollback(conn, value)
     end
   end
 
-  defp begin(repo, mod, mode, queue_time, opts) do
-    sql = begin_sql(mod, mode)
-    query(repo, sql, [], queue_time, nil, opts)
-  end
+  ## Log
 
-  defp begin_sql(mod, :raw),     do: mod.begin_transaction
-  defp begin_sql(mod, :sandbox), do: mod.savepoint "ecto_trans"
-
-  defp commit(repo, ref, mod, :raw, timeout, opts, result) do
-    case query(repo, mod.commit, [], nil, nil, opts) do
-      {{:ok, _}, entry} ->
-        {result, entry}
-      {{:error, _}, _entry} = error ->
-        Pool.break(ref, timeout)
-        error
-      :noconnect ->
-        {result, nil}
+  defp with_log(repo, params, opts) do
+    case Keyword.pop(opts, :log, true) do
+      {true, opts}  -> [log: &log(repo, params, &1)] ++ opts
+      {false, opts} -> opts
     end
   end
 
-  defp commit(_repo, _ref, _mod, _mode, _timeout, _opts, result) do
-    {result, nil}
+  defp log(repo, params, entry) do
+    %{connection_time: query_time, decode_time: decode_time,
+      pool_time: queue_time, result: result, query: query} = entry
+    repo.__log__(%Ecto.LogEntry{query_time: query_time, decode_time: decode_time,
+                                queue_time: queue_time, result: log_result(result),
+                                params: params, query: String.Chars.to_string(query)})
   end
 
-  defp rollback(repo, ref, mod, mode, timeout, opts, result) do
-    sql = rollback_sql(mod, mode)
+  defp log_result({:ok, _query, res}), do: {:ok, res}
+  defp log_result(other), do: other
 
-    case query(repo, sql, [], nil, nil, opts) do
-      {{:ok, _}, entry} ->
-        {result, entry}
-      {{:error, _}, _entry} = error ->
-        Pool.break(ref, timeout)
-        error
-      :noconnect ->
-        {result, nil}
-    end
+  ## Connection helpers
+
+  defp put_conn(pool, conn) do
+    _ = Process.put(key(pool), conn)
+    :ok
   end
 
-  defp rollback_sql(mod, :raw), do: mod.rollback
-  defp rollback_sql(mod, :sandbox) do
-    mod.rollback_to_savepoint "ecto_trans"
+  defp get_conn(pool) do
+    Process.get(key(pool))
   end
+
+  defp delete_conn(pool) do
+    _ = Process.delete(key(pool))
+    :ok
+  end
+
+  defp key(pool), do: {__MODULE__, pool}
 end

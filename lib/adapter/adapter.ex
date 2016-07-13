@@ -95,12 +95,12 @@ defmodule Apartmentex.Adapter do
   ## Adapter start
 
   Because some Ecto tasks like migration may run without starting
-  the parent application, it is recommended that start_link in
+  the parent application, it is recommended that child_spec in
   adapters make sure the adapter application is started by calling
   `Application.ensure_all_started/1`.
   """
-  defcallback start_link(repo, options) ::
-              {:ok, pid} | {:error, {:already_started, pid}} | {:error, term}
+  defcallback child_spec(repo, options) ::
+              Supervisor.Spec.spec
 
   @doc """
   Commands invoked to prepare a query for `all`, `update_all` and `delete_all`.

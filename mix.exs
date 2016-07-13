@@ -28,6 +28,6 @@ defmodule Apartmentex.Mixfile do
   # Type "mix help deps" for more examples and options
   defp deps do
     [{:postgrex, "~> 0.11.0"},
-    {:ecto, "~> 1.1.8"}]
+    {:ecto, path: "deps/ecto"}]
   end
 end

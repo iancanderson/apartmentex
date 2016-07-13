@@ -18,8 +18,7 @@ defmodule Apartmentex.ApartmentexTest do
   end
 
   setup do
-    Ecto.Adapters.SQL.restart_test_transaction(TestPostgresRepo)
-    :ok
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(TestPostgresRepo)
   end
 
   test ".all/4 only returns the tenant's records" do

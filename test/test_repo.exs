@@ -5,9 +5,7 @@ defmodule Apartmentex.TestAdapter do
 
   defmacro __before_compile__(_opts), do: :ok
 
-  def start_link(_repo, opts) do
-    Apartmentex.TestRepo.Pool  = opts[:pool_name]
-    Ecto.Pools.Poolboy         = opts[:pool]
+  def child_spec(_repo, opts) do
     Apartmentex.TestRepo       = opts[:repo]
 
     :ecto   = opts[:otp_app]
@@ -16,7 +14,7 @@ defmodule Apartmentex.TestAdapter do
     "hello" = opts[:database]
     "local" = opts[:hostname]
 
-    Task.start_link(fn -> :timer.sleep(:infinity) end)
+    Supervisor.Spec.worker(Task, [fn -> :timer.sleep(:infinity) end])
   end
 
   def stop(_, _, _) do
