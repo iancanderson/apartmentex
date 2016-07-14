@@ -1,6 +1,5 @@
 defmodule Apartmentex.Migration do
   @moduledoc """
-
   """
 
   defmodule Index do
@@ -8,21 +7,23 @@ defmodule Apartmentex.Migration do
     Defines an index struct used in migrations.
     """
     defstruct table: nil,
-              name: nil,
               prefix: nil,
+              name: nil,
               columns: [],
               unique: false,
               concurrently: false,
-              using: nil
+              using: nil,
+              where: nil
 
     @type t :: %__MODULE__{
       table: atom,
-      name: atom,
       prefix: atom,
+      name: atom,
       columns: [atom | String.t],
       unique: boolean,
       concurrently: boolean,
-      using: atom | String.t
+      using: atom | String.t,
+      where: atom | String.t
     }
   end
 
@@ -31,27 +32,25 @@ defmodule Apartmentex.Migration do
     Defines a table struct used in migrations.
     """
     defstruct name: nil, prefix: nil, primary_key: true, engine: nil, options: nil
-    @type t :: %__MODULE__{name: atom, prefix: atom, primary_key: boolean, engine: atom}
+    @type t :: %__MODULE__{name: atom, prefix: atom | nil, primary_key: boolean,
+                           engine: atom, options: String.t}
   end
 
   defmodule Reference do
     @moduledoc """
     Defines a reference struct used in migrations.
     """
-    defstruct name: nil,
-              table: nil,
-              prefix: nil,
-              column: :id,
-              type: :serial,
-              on_delete: :nothing
+    defstruct name: nil, table: nil, column: :id, type: :serial, on_delete: :nothing, on_update: :nothing
+    @type t :: %__MODULE__{table: atom, column: atom, type: atom, on_delete: atom, on_update: atom}
+  end
 
-    @type t :: %__MODULE__{
-      table: atom,
-      prefix: atom,
-      column: atom,
-      type: atom,
-      on_delete: atom
-    }
+  defmodule Constraint do
+    @moduledoc """
+    Defines a Constraint struct used in migrations.
+    """
+    defstruct name: nil, table: nil, check: nil, exclude: nil, prefix: nil
+    @type t :: %__MODULE__{name: atom, table: atom, prefix: atom | nil,
+                           check: String.t | nil, exclude: String.t | nil}
   end
 
   alias Apartmentex.Migration.Runner
@@ -106,7 +105,7 @@ defmodule Apartmentex.Migration do
   defp do_create(object, command, block) do
     quote do
       table = %Table{} = unquote(object)
-      Runner.start_command({unquote(command), %{table | prefix: prefix(table.prefix)}})
+      Runner.start_command({unquote(command), Ecto.Migration.__prefix__(table)})
 
       if table.primary_key do
         add(:id, :serial, primary_key: true)
@@ -133,14 +132,18 @@ defmodule Apartmentex.Migration do
   defmacro alter(object, do: block) do
     quote do
       table = %Table{} = unquote(object)
-      Runner.start_command({:alter, %{table | prefix: prefix(table.prefix)}})
+      Runner.start_command({:alter, Ecto.Migration.__prefix__(table)})
       unquote(block)
       Runner.end_command
     end
   end
 
   @doc """
-  Creates an index or a table with only `:id` field.
+  Creates one of the following:
+
+    * an index
+    * a table with only an `:id` field
+    * a constraint
 
   When reversing (in `change` running backward) indexes are only dropped if they
   exist and no errors are raised. To enforce dropping an index use `drop/1`.
@@ -148,12 +151,18 @@ defmodule Apartmentex.Migration do
   ## Examples
 
       create index(:posts, [:name])
-
       create table(:version)
+      create constraint(:products, "price_must_be_positive", check: "price > 0")
 
   """
   def create(%Index{} = index) do
-    Runner.execute {:create, %{index | prefix: prefix(index.prefix)}}
+    Runner.execute {:create, __prefix__(index)}
+    index
+  end
+
+  def create(%Constraint{} = constraint) do
+    Runner.execute {:create, __prefix__(constraint)}
+    constraint
   end
 
   def create(%Table{} = table) do
@@ -172,7 +181,7 @@ defmodule Apartmentex.Migration do
 
   """
   def create_if_not_exists(%Index{} = index) do
-    Runner.execute {:create_if_not_exists, %{index | prefix: prefix(index.prefix)}}
+    Runner.execute {:create_if_not_exists, __prefix__(index)}
   end
 
   def create_if_not_exists(%Table{} = table) do
@@ -187,21 +196,26 @@ defmodule Apartmentex.Migration do
         []
       end
 
-    Runner.execute {command, %{table | prefix: prefix(table.prefix)}, columns}
+    Runner.execute {command, __prefix__(table), columns}
   end
 
   @doc """
-  Drops a table or index.
+  Drops one of the following:
+
+    * an index
+    * a table
+    * a constraint
 
   ## Examples
 
       drop index(:posts, [:name])
       drop table(:posts)
+      drop constraint(:products, name: "price_must_be_positive")
 
   """
-  def drop(%{} = object) do
-    Runner.execute {:drop, %{object | prefix: prefix(object.prefix)}}
-    object
+  def drop(%{} = index_or_table_or_constraint) do
+    Runner.execute {:drop, __prefix__(index_or_table_or_constraint)}
+    index_or_table_or_constraint
   end
 
   @doc """
@@ -215,8 +229,9 @@ defmodule Apartmentex.Migration do
       drop_if_exists table(:posts)
 
   """
-  def drop_if_exists(%{} = object) do
-    Runner.execute {:drop_if_exists, %{object | prefix: prefix(object.prefix)}}
+  def drop_if_exists(%{} = index_or_table) do
+    Runner.execute {:drop_if_exists, __prefix__(index_or_table)}
+    index_or_table
   end
 
   @doc """
@@ -264,6 +279,8 @@ defmodule Apartmentex.Migration do
     * `:unique` - if the column(s) is unique or not
     * `:concurrently` - if the index should be created/dropped concurrently
     * `:using` - configures the index type
+    * `:prefix` - prefix for the index
+    * `:where` - the conditions for a partial index
 
   ## Adding/dropping indexes concurrently
 
@@ -286,6 +303,18 @@ defmodule Apartmentex.Migration do
   More information on index types can be found in the [PostgreSQL
   docs](http://www.postgresql.org/docs/9.4/static/indexes-types.html).
 
+  ## Partial indexes
+
+  Databases like PostgreSQL and MSSQL supports partial indexes.
+
+  A partial index is an index built over a subset of a table. The subset
+  is defined by a conditional expression using the `:where` option.
+  The `:where` option can be an atom or a string; its value is passed
+  to the `WHERE` clause as is.
+
+  More information on partial indexes can be found in the [PostgreSQL
+  docs](http://www.postgresql.org/docs/9.4/static/indexes-partial.html).
+
   ## Examples
 
       # Without a name, index defaults to products_category_id_sku_index
@@ -302,6 +331,9 @@ defmodule Apartmentex.Migration do
 
       # Create an index on custom expressions
       create index(:products, ["lower(name)"], name: :products_lower_name_index)
+
+      # Create a partial index
+      create index(:products, [:user_id], where: "price = 0", name: :free_products_index)
 
   """
   def index(table, columns, opts \\ []) when is_atom(table) and is_list(columns) do
@@ -350,22 +382,29 @@ defmodule Apartmentex.Migration do
   end
 
   @doc """
+  Gets the migrator prefix.
+  """
+  def prefix do
+    Runner.prefix
+  end
+
+  @doc """
   Adds a column when creating or altering a table.
 
   This function also accepts Ecto primitive types as column types
   and they are normalized by the database adapter. For example,
-  `string` is converted to varchar, `datetime` to the underlying
-  datetime or timestamp type, `binary` to bits or blob, and so on.
+  `:string` is converted to `:varchar`, `:datetime` to the underlying
+  `:datetime` or `:timestamp` type, `:binary` to `:bits` or `:blob`, and so on.
 
-  However, the column type is not always the same as the type in your
-  model. For example, a model that has a `string` field, can be
-  supported by columns of types `char`, `varchar`, `text` and others.
-  For this reason, this function also accepts `text` and other columns,
+  However, the column type is not always the same as the type used in your
+  schema. For example, a schema that has a `:string` field,
+  can be supported by columns of types `:char`, `:varchar`, `:text` and others.
+  For this reason, this function also accepts `:text` and other columns,
   which are sent as is to the underlying database.
 
   To sum up, the column type may be either an Ecto primitive type,
   which is normalized in cases the database does not understand it,
-  like `string` or `binary`, or a database type which is passed as is.
+  like `:string` or `:binary`, or a database type which is passed as is.
   Custom Ecto types, like `Ecto.Datetime`, are not supported because
   they are application level concern and may not always map to the
   database.
@@ -406,7 +445,7 @@ defmodule Apartmentex.Migration do
       rename table(:posts), to: table(:new_posts)
   """
   def rename(%Table{} = table_current, to: %Table{} = table_new) do
-    Runner.execute {:rename, %{table_current | prefix: prefix(table_current.prefix)}, %{table_new | prefix: prefix(table_new.prefix)}}
+    Runner.execute {:rename, __prefix__(table_current), __prefix__(table_new)}
     table_new
   end
 
@@ -418,7 +457,7 @@ defmodule Apartmentex.Migration do
       rename table(:posts), :title, to: :summary
   """
   def rename(%Table{} = table, current_column, to: new_column) when is_atom(current_column) and is_atom(new_column) do
-    Runner.execute {:rename, %{table | prefix: prefix(table.prefix)}, current_column, new_column}
+    Runner.execute {:rename, __prefix__(table), current_column, new_column}
     table
   end
 
@@ -441,11 +480,22 @@ defmodule Apartmentex.Migration do
   Those columns are of `:datetime` type and by default cannot
   be null. `opts` can be given to customize the generated
   fields.
+
+  ## Options
+
+    * `:inserted_at` -  the name of the column for insertion times
+    * `:updated_at` - the name of the column for update times
   """
   def timestamps(opts \\ []) do
     opts = Keyword.put_new(opts, :null, false)
-    add(:inserted_at, :datetime, opts)
-    add(:updated_at, :datetime, opts)
+
+    inserted_at = opts[:inserted_at] || :inserted_at
+    updated_at = opts[:updated_at] || :updated_at
+
+    opts = Keyword.drop opts, [:inserted_at, :updated_at]
+
+    add(inserted_at, :datetime, opts)
+    add(updated_at, :datetime, opts)
   end
 
   @doc """
@@ -464,8 +514,8 @@ defmodule Apartmentex.Migration do
     * `:null` - sets to null or not null
     * `:default` - changes the default
     * `:size` - the size of the type (for example the numbers of characters). Default is no size.
-    * `:precision` - the precision for a numberic type. Default is no precision.
-    * `:scale` - the scale of a numberic type. Default is 0 scale.
+    * `:precision` - the precision for a numeric type. Default is no precision.
+    * `:scale` - the scale of a numeric type. Default is 0 scale.
   """
   def modify(column, type, opts \\ []) when is_atom(column) do
     Runner.subcommand {:modify, column, type, opts}
@@ -501,8 +551,11 @@ defmodule Apartmentex.Migration do
     * `:column` - The foreign key column, default is `:id`
     * `:type`   - The foreign key type, default is `:serial`
     * `:on_delete` - What to perform if the entry is deleted.
-      May be `:nothing`, `:delete_all` or `:nilify_all`.
-      Defaults to `:nothing`.
+         May be `:nothing`, `:delete_all` or `:nilify_all`.
+         Defaults to `:nothing`.
+    * `:on_update` - What to perform if the entry is updated.
+         May be `:nothing`, `:update_all` or `:nilify_all`.
+         Defaults to `:nothing`.
 
   """
   def references(table, opts \\ []) when is_atom(table) do
@@ -512,7 +565,30 @@ defmodule Apartmentex.Migration do
       raise ArgumentError, "unknown :on_delete value: #{inspect reference.on_delete}"
     end
 
-    %{reference | prefix: prefix(reference.prefix)}
+    unless reference.on_update in [:nothing, :update_all, :nilify_all] do
+      raise ArgumentError, "unknown :on_update value: #{inspect reference.on_update}"
+    end
+
+    reference
+  end
+
+  @doc ~S"""
+  Defines a constraint (either a check constraint or an exclusion constraint) to be evaluated by the database when a row is inserted or updated.
+
+  ## Examples
+
+      create constraint(:users, :price_must_be_positive, check: "price > 0")
+      create constraint(:size_ranges, :no_overlap, exclude: ~s|gist (int4range("from", "to", '[]') WITH &&)|
+      drop   constraint(:products, "price_must_be_positive")
+
+  ## Options
+
+    * `:check` - The expression to evaluate on a row. Required when creating.
+    * `:name` - The name of the constraint - required.
+
+  """
+  def constraint(table, name, opts \\ [] ) do
+    struct(%Constraint{table: table, name: name}, opts)
   end
 
   @doc """
@@ -544,16 +620,18 @@ defmodule Apartmentex.Migration do
     reference
   end
 
-  def prefix(opts_prefix) when is_nil(opts_prefix) do
-    Runner.prefix()
-  end
+  @doc false
+  def __prefix__(%{prefix: prefix} = index_or_table) do
+    runner_prefix = Runner.prefix()
 
-  def prefix(opts_prefix) do
-    case {Runner.prefix(), Runner.prefix() == opts_prefix} do
-      {nil, _} -> opts_prefix
-      {prefix, true} -> prefix
-      {_, false} -> raise Ecto.MigrationError, 
-        message: "prefixes given as migration options must match global migrator prefix"
+    cond do
+      is_nil(prefix) ->
+        %{index_or_table | prefix: runner_prefix}
+      is_nil(runner_prefix) or runner_prefix == prefix ->
+        index_or_table
+      true ->
+        raise Ecto.MigrationError,  message:
+          "the :prefix option `#{inspect prefix}` does match the migrator prefix `#{inspect runner_prefix}`"
     end
   end
 end

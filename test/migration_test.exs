@@ -6,7 +6,7 @@ defmodule Apartmentex.MigrationTest do
 
   use Apartmentex.Migration
 
-  alias Apartmentex.TestRepo
+  alias Apartmentex.TestPostgresRepo
   alias Apartmentex.Migration.Table
   alias Apartmentex.Migration.Index
   alias Apartmentex.Migration.Reference
@@ -15,25 +15,23 @@ defmodule Apartmentex.MigrationTest do
 
   setup meta do
     ensure_manager_started
-    Runner.start_link(TestRepo, meta[:direction] || :forward, :up, false, nil)
-    :ok
+    {:ok, runner} = Runner.start_link(self(), TestPostgresRepo, meta[:direction] || :forward, :up, false, nil)
+    Runner.metadata(runner, meta)
+    {:ok, runner: runner}
   end
 
   test "defines __migration__ function" do
     assert function_exported?(__MODULE__, :__migration__, 0)
-    Runner.stop()
   end
 
   test "allows direction to be retrieved" do
     assert direction() == :up
-    Runner.stop()
   end
 
   test "creates a table" do
     assert table(:posts) == %Table{name: :posts, primary_key: true}
     assert table(:posts, primary_key: false) == %Table{name: :posts, primary_key: false}
     assert table(:posts, prefix: :foo) == %Table{name: :posts, primary_key: true, prefix: :foo}
-    Runner.stop()
   end
 
   test "creates an index" do
@@ -45,7 +43,6 @@ defmodule Apartmentex.MigrationTest do
            %Index{table: :posts, unique: true, name: :foo, columns: [:title]}
     assert unique_index(:posts, [:title], name: :foo) ==
            %Index{table: :posts, unique: true, name: :foo, columns: [:title]}
-    Runner.stop()
   end
 
   test "creates a reference" do
@@ -53,7 +50,6 @@ defmodule Apartmentex.MigrationTest do
            %Reference{table: :posts, column: :id, type: :serial}
     assert references(:posts, type: :uuid, column: :other) ==
            %Reference{table: :posts, column: :other, type: :uuid}
-    Runner.stop()
   end
 
   test "chokes on alias types" do
@@ -61,17 +57,15 @@ defmodule Apartmentex.MigrationTest do
                  ~r"Ecto.DateTime is not a valid database type", fn ->
       add(:hello, Ecto.DateTime)
     end
-    Runner.stop()
   end
 
-  test "flush clears out commands" do
+  test "flush clears out commands", %{runner: runner} do
     execute "TEST"
     commands = Agent.get(runner, & &1.commands)
     assert commands == ["TEST"]
     flush
     commands = Agent.get(runner, & &1.commands)
     assert commands == []
-    Runner.stop()
   end
 
   ## Forward
@@ -81,14 +75,12 @@ defmodule Apartmentex.MigrationTest do
     execute "HELLO, IS IT ME YOU ARE LOOKING FOR?"
     flush
     assert last_command() == "HELLO, IS IT ME YOU ARE LOOKING FOR?"
-    Runner.stop()
   end
 
   test "forward: executes given keyword command" do
     execute create: "posts", capped: true, size: 1024
     flush
     assert last_command() == [create: "posts", capped: true, size: 1024]
-    Runner.stop()
   end
 
   test "forward: creates a table" do
@@ -119,7 +111,6 @@ defmodule Apartmentex.MigrationTest do
     assert last_command() ==
            {:create, table,
               [{:add, :title, :string, []}]}
-    Runner.stop()
   end
 
   test "forward: creates an empty table" do
@@ -128,7 +119,6 @@ defmodule Apartmentex.MigrationTest do
 
     assert last_command() ==
            {:create, table, [{:add, :id, :serial, [primary_key: true]}]}
-    Runner.stop()
   end
 
   test "forward: alters a table" do
@@ -144,7 +134,6 @@ defmodule Apartmentex.MigrationTest do
               [{:add, :summary, :text, []},
                {:modify, :title, :text, []},
                {:remove, :views}]}
-    Runner.stop()
   end
 
   test "forward: rename column" do
@@ -153,7 +142,6 @@ defmodule Apartmentex.MigrationTest do
 
     assert last_command() == {:rename, %Table{name: :posts}, :given_name, :first_name}
     assert result == table(:posts)
-    Runner.stop()
   end
 
   test "forward: drops a table" do
@@ -161,21 +149,18 @@ defmodule Apartmentex.MigrationTest do
     flush
     assert {:drop, %Table{}} = last_command()
     assert result == table(:posts)
-    Runner.stop()
   end
 
   test "forward: creates an index" do
     create index(:posts, [:title])
     flush
     assert {:create, %Index{}} = last_command()
-    Runner.stop()
   end
 
   test "forward: drops an index" do
     drop index(:posts, [:title])
     flush
     assert {:drop, %Index{}} = last_command()
-    Runner.stop()
   end
 
   test "forward: renames a table" do
@@ -183,7 +168,6 @@ defmodule Apartmentex.MigrationTest do
     flush
     assert {:rename, %Table{name: :posts}, %Table{name: :new_posts}} = last_command()
     assert result == table(:new_posts)
-    Runner.stop()
   end
 
   #prefix
@@ -195,7 +179,6 @@ defmodule Apartmentex.MigrationTest do
     {_, table, _} = last_command()
 
     assert table.prefix == :foo
-    Runner.stop()
   end
 
   test "forward: creates a table with prefix from manager" do
@@ -245,7 +228,7 @@ defmodule Apartmentex.MigrationTest do
 
   test "forward: drops a table with prefix from manager" do
     Runner.stop()
-    Runner.start_link(TestRepo, :forward, :up, false, :foo)
+    Runner.start_link(self(), TestRepo, :forward, :up, false, :foo)
 
     drop(table(:posts))
     flush
@@ -261,7 +244,6 @@ defmodule Apartmentex.MigrationTest do
     {_, table, _, new_name} = last_command()
     assert table.prefix == :foo
     assert new_name == :first_name
-    Runner.stop()
   end
 
   test "forward: rename column on table with index prefixed from manager" do
@@ -282,7 +264,6 @@ defmodule Apartmentex.MigrationTest do
     flush
     {_, index} = last_command()
     assert index.prefix == :foo
-    Runner.stop()
   end
 
   test "forward: creates an index with prefix from manager" do
@@ -301,7 +282,6 @@ defmodule Apartmentex.MigrationTest do
     flush
     {_, index} = last_command()
     assert index.prefix == :foo
-    Runner.stop()
   end
 
   test "forward: drops an index with a prefix from manager" do
@@ -323,7 +303,6 @@ defmodule Apartmentex.MigrationTest do
       execute "HELLO, IS IT ME YOU ARE LOOKING FOR?"
       flush
     end
-    Runner.stop()
   end
 
   test "backward: creates a table" do
@@ -334,7 +313,6 @@ defmodule Apartmentex.MigrationTest do
     flush
 
     assert last_command() == {:drop, table}
-    Runner.stop()
   end
 
   test "backward: creates an empty table" do
@@ -342,7 +320,6 @@ defmodule Apartmentex.MigrationTest do
     flush
 
     assert last_command() == {:drop, table}
-    Runner.stop()
   end
 
   test "backward: alters a table" do
@@ -361,7 +338,6 @@ defmodule Apartmentex.MigrationTest do
       end
       flush
     end
-    Runner.stop()
   end
 
   test "backward: rename column" do
@@ -369,7 +345,6 @@ defmodule Apartmentex.MigrationTest do
     flush
 
     assert last_command() == {:rename, %Table{name: :posts}, :first_name, :given_name}
-    Runner.stop()
   end
 
   test "backward: drops a table" do
@@ -377,35 +352,31 @@ defmodule Apartmentex.MigrationTest do
       drop table(:posts)
       flush
     end
-    Runner.stop()
   end
 
   test "backward: creates an index" do
     create index(:posts, [:title])
     flush
     assert {:drop_if_exists, %Index{}} = last_command()
-    Runner.stop()
   end
 
   test "backward: drops an index" do
     drop index(:posts, [:title])
     flush
     assert {:create, %Index{}} = last_command()
-    Runner.stop()
   end
 
   test "backward: renames a table" do
     rename table(:posts), to: table(:new_posts)
     flush
     assert {:rename, %Table{name: :new_posts}, %Table{name: :posts}} = last_command()
-    Runner.stop()
   end
 
   defp last_command(), do: Process.get(:last_command)
 
-  defp runner do
-    Manager.get_runner(self())
-  end
+  # defp runner do
+  #   Manager.get_runner(self())
+  # end
 
   defp ensure_manager_started do
     case Manager.start_link do

@@ -25,6 +25,7 @@ defmodule Apartmentex.ApartmentexTest do
     tenant_id = 2
     other_tenant_id = 1
 
+
     Apartmentex.new_tenant(TestPostgresRepo, tenant_id)
     Apartmentex.new_tenant(TestPostgresRepo, other_tenant_id)
 
